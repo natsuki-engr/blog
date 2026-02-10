@@ -11,10 +11,15 @@
 | D1 (閲覧数用) | Cloudflare D1 | 閲覧数カウント用（自前で設計。同一 D1 インスタンスに別テーブル） |
 | スタイリング | 未定（Tailwind CSS 推奨） | |
 
-> **補足: Nuxt Content v3 のデータフロー**
+> **補足: Nuxt Content v3 のデータフロー（公式ドキュメントより）**
 >
 > Nuxt Content は **git-based CMS** であり、コンテンツの原本は Git リポジトリ内の Markdown ファイルです。
-> D1 はあくまで**ビルド時に Markdown を解析した結果を格納し、高速にクエリするための内部キャッシュ**として使われます。
+> DB はコンテンツの原本ではなく、以下の 3 ステップで内部的に利用されるクエリキャッシュです:
+>
+> 1. **ビルド時**: 各コレクションの Markdown を解析 → AST に変換 → スキーマに基づくテーブルに格納 → ダンプファイルとして保存
+> 2. **ランタイム (コールドスタート)**: 最初のクエリ実行時にダンプを DB に復元（整合性チェック付き）
+> 3. **ブラウザ (クライアント側)**: 最初のクエリ時にダンプをダウンロード → ブラウザ内 WASM SQLite で以降のクエリをローカル実行
+>
 > コンテンツ用の DB 設計やマイグレーションを自分で行う必要はありません。
 > 自前で D1 のテーブル設計が必要なのは **閲覧数カウント (`page_views`) のみ** です。
 
@@ -32,12 +37,43 @@ cd blog
 ### 1-2. Nuxt Content v3 インストール
 
 ```bash
-npx nuxi module add content
+# パッケージマネージャーでインストール
+pnpm add @nuxt/content
+
+# nuxt.config.ts の modules に追加
+# (nuxi module add content でも可)
 ```
 
-### 1-3. content.config.ts の作成
+`nuxt.config.ts`:
 
-ブログ記事用のコレクションを定義する。
+```ts
+export default defineNuxtConfig({
+  modules: ['@nuxt/content'],
+})
+```
+
+> **注意 (pnpm v10+)**: `better-sqlite3` のネイティブビルドが必要。`pnpm approve-builds` を実行するか、
+> `package.json` に以下を追加:
+> ```json
+> { "pnpm": { "onlyBuiltDependencies": ["better-sqlite3"] } }
+> ```
+
+### 1-3. app.vue の更新
+
+`pages/` ディレクトリを使用するために `app.vue` を更新:
+
+```vue
+<!-- app.vue -->
+<template>
+  <NuxtLayout>
+    <NuxtPage />
+  </NuxtLayout>
+</template>
+```
+
+### 1-4. content.config.ts の作成
+
+ブログ記事用のコレクションを定義する。`type: 'page'` はコンテンツファイルとページが 1:1 対応することを意味する。
 
 ```ts
 // content.config.ts
@@ -50,8 +86,6 @@ export default defineContentConfig({
       type: 'page',
       source: 'blog/**/*.md',
       schema: z.object({
-        title: z.string(),
-        description: z.string(),
         date: z.date(),
         tags: z.array(z.string()).optional(),
         image: z.string().optional(),
@@ -62,7 +96,10 @@ export default defineContentConfig({
 })
 ```
 
-### 1-4. サンプル記事の作成
+> **補足**: `title` と `description` は `type: 'page'` のビルトインフィールドとして自動提供される。
+> `content.config.ts` が存在する場合、定義されたパターンに一致するファイルのみがインポートされる。
+
+### 1-5. サンプル記事の作成
 
 ```
 content/
@@ -151,7 +188,7 @@ export default defineNuxtConfig({
   modules: ['@nuxt/content'],
 
   nitro: {
-    preset: 'cloudflare-pages',
+    preset: 'cloudflare_pages',
   },
 })
 ```
@@ -163,25 +200,33 @@ export default defineNuxtConfig({
 npx wrangler d1 create blog-db
 ```
 
-### 3-3. wrangler.toml の設定
+### 3-3. Cloudflare ダッシュボードで D1 を Pages プロジェクトにバインド
 
-```toml
-name = "blog"
-compatibility_date = "2026-02-10"
-pages_build_output_dir = ".output/public"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "blog-db"
-database_id = "<作成時に取得した ID>"
-```
+Cloudflare ダッシュボード → Pages プロジェクト → Settings → Bindings から、
+作成した D1 データベースをバインディング名 **`DB`** で接続する。
 
 > **注意**: Nuxt Content v3 はデフォルトで `DB` というバインディング名を使用する。
 
-### 3-4. ローカルプレビュー
+### 3-4. ローカルプレビュー用の wrangler.jsonc
+
+`nuxi dev` と `nuxi build` は追加設定不要。
+`nuxi preview` でビルド結果をローカルテストする場合のみ、Wrangler 設定が必要:
+
+```jsonc
+// wrangler.jsonc
+{
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "blog-db",
+      "database_id": "local-dev-id"  // ローカル用なので任意の値でOK
+    }
+  ]
+}
+```
 
 ```bash
-npx nuxi build
+nuxi build
 npx wrangler pages dev .output/public
 ```
 
@@ -221,12 +266,11 @@ CREATE TABLE IF NOT EXISTS page_views (
 ```ts
 export default defineEventHandler(async (event) => {
   const path = '/' + (getRouterParam(event, 'path') || '')
-  const db = hubDatabase() // NuxtHub 利用時
-  // または: const { DB } = event.context.cloudflare.env // 直接バインディング利用時
+  const { DB } = event.context.cloudflare.env
 
   if (event.method === 'POST') {
     // UPSERT: 閲覧数をインクリメント
-    await db.prepare(`
+    await DB.prepare(`
       INSERT INTO page_views (path, count, updated_at)
       VALUES (?, 1, datetime('now'))
       ON CONFLICT(path) DO UPDATE SET
@@ -238,7 +282,7 @@ export default defineEventHandler(async (event) => {
   }
 
   // GET: 閲覧数を取得
-  const row = await db.prepare(
+  const row = await DB.prepare(
     'SELECT count FROM page_views WHERE path = ?'
   ).bind(path).first()
 
@@ -343,9 +387,10 @@ blog/
 │   └── api/
 │       └── views/
 │           └── [...path].ts
+├── app.vue
 ├── content.config.ts
 ├── nuxt.config.ts
-├── wrangler.toml
+├── wrangler.jsonc          # ローカルプレビュー用（本番はダッシュボードで設定）
 └── package.json
 ```
 
